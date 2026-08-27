@@ -6,9 +6,10 @@
  * Enhancements (GF-043):
  *  - `withRetry()` wraps every Soroban RPC call with exponential-backoff retry
  *    (default 3 retries, 100 ms base delay, doubles each attempt).
- *  - `rpcBreaker` is a CircuitBreaker that opens after 5 consecutive failures
- *    and resets after 30 s, preventing continued hammering of the RPC endpoint.
+ *  - `rpcBreaker` is a Soroban-only CircuitBreaker that opens after 5
+ *    consecutive failures and resets after 30 s.
  *  - `sorobanRpcRetriesTotal` Prometheus Counter tracks total retry attempts.
+ *  - Horizon submission retries use an independent breaker and counter.
  *  - Retry is only triggered for *transient* errors (ECONNRESET, ETIMEDOUT,
  *    HTTP 502/503, "socket hang up"). Non-retryable errors propagate immediately.
  */
@@ -77,6 +78,20 @@ const rpcBreaker = new CircuitBreaker({
   resetTimeout: 30_000,
 });
 
+/** Independent circuit breaker for Horizon transaction submissions. */
+const horizonRpcBreaker = new CircuitBreaker({
+  name: "horizon",
+  failureThreshold: 5,
+  resetTimeout: 30_000,
+});
+
+/** Total number of Horizon transaction submission retry attempts. */
+const horizonRetriesTotal = new Counter({
+  name: "indigopay_horizon_retries_total",
+  help: "Total Horizon retry attempts due to transient errors",
+  registers: [registry],
+});
+
 /** Maximum number of retries per RPC call (env-configurable). */
 const MAX_RETRIES = Number(process.env.SOROBAN_RPC_MAX_RETRIES || 3);
 
@@ -101,7 +116,7 @@ function isRetryable(err) {
 }
 
 /**
- * Execute `fn` with exponential-backoff retry, routed through `rpcBreaker`.
+ * Execute `fn` with exponential-backoff retry through the supplied breaker.
  *
  * Algorithm:
  *   attempt 0 → immediate
@@ -118,12 +133,20 @@ function isRetryable(err) {
  * @param {Function} [onRetry]    Called once immediately before each retry.
  * @returns {Promise<*>}
  */
-async function withRetry(fn, maxRetries = MAX_RETRIES, onRetry) {
+async function retryWithBreaker(
+  fn,
+  maxRetries,
+  breaker,
+  retryCounter,
+  retryEvent,
+  retryDescription,
+  onRetry,
+) {
   let lastError;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      return await rpcBreaker.call(fn);
+      return await breaker.call(fn);
     } catch (err) {
       lastError = err;
 
@@ -141,15 +164,15 @@ async function withRetry(fn, maxRetries = MAX_RETRIES, onRetry) {
         }
         logger.warn(
           {
-            event: "soroban_rpc_retry",
+            event: retryEvent,
             attempt: attempt + 1,
             maxRetries,
             delayMs: delay,
             err: err.message,
           },
-          `Soroban RPC transient error — retrying (attempt ${attempt + 1}/${maxRetries}) after ${delay}ms`,
+          `${retryDescription} — retrying (attempt ${attempt + 1}/${maxRetries}) after ${delay}ms`,
         );
-        sorobanRpcRetriesTotal.inc();
+        retryCounter.inc();
         await new Promise((resolve) => setTimeout(resolve, delay));
       } else {
         throw lastError;
@@ -158,6 +181,39 @@ async function withRetry(fn, maxRetries = MAX_RETRIES, onRetry) {
   }
 
   throw lastError;
+}
+
+/**
+ * Execute a Soroban RPC call with the existing Soroban retry semantics.
+ *
+ * @param {Function} fn           Async function to call.
+ * @param {number}   [maxRetries] Override for MAX_RETRIES.
+ * @param {Function} [onRetry]    Called once immediately before each retry.
+ * @returns {Promise<*>}
+ */
+async function withRetry(fn, maxRetries = MAX_RETRIES, onRetry) {
+  return retryWithBreaker(
+    fn,
+    maxRetries,
+    rpcBreaker,
+    sorobanRpcRetriesTotal,
+    "soroban_rpc_retry",
+    "Soroban RPC transient error",
+    onRetry,
+  );
+}
+
+/** Horizon-only equivalent used for non-Soroban transaction submissions. */
+async function withHorizonRetry(fn, maxRetries = MAX_RETRIES, onRetry) {
+  return retryWithBreaker(
+    fn,
+    maxRetries,
+    horizonRpcBreaker,
+    horizonRetriesTotal,
+    "horizon_retry",
+    "Horizon transient error",
+    onRetry,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +510,7 @@ async function submitWithFeeBump(transaction, keypair, options = {}) {
         const res = await submitTransaction(currentTx.toXDR());
         hash = res.hash || currentTx.hash().toString('hex'); // submitTransaction returns hash in some versions
       } else {
-        const res = await withRetry(
+        const res = await withHorizonRetry(
           () => server.submitTransaction(currentTx),
           undefined,
           options && options.onRetry,
@@ -516,6 +572,8 @@ module.exports = {
   isRetryable,
   rpcBreaker,
   sorobanRpcRetriesTotal,
+  horizonRpcBreaker,
+  horizonRetriesTotal,
   // Service functions
   getOnChainProject,
   getProjectDonationEvents,

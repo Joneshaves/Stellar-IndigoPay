@@ -4,6 +4,7 @@ const mockPoolQuery = jest.fn();
 const mockHorizonServer = { loadAccount: jest.fn() };
 const mockSubmitWithFeeBump = jest.fn();
 const mockGetTransaction = jest.fn();
+const mockMemoText = jest.fn();
 const mockTransaction = {
   sign: jest.fn(),
   hash: jest.fn().mockReturnValue({ toString: jest.fn().mockReturnValue("tx-hash") }),
@@ -43,8 +44,8 @@ jest.mock("@stellar/stellar-sdk", () => ({
   Networks: { TESTNET: "testnet", PUBLIC: "public" },
   Operation: {
     payment: jest.fn(),
-    memo: jest.fn(),
   },
+  Memo: { text: mockMemoText },
   Asset: { native: jest.fn() },
   Keypair: { fromSecret: jest.fn().mockReturnValue(mockKeypair) },
 }));
@@ -90,6 +91,9 @@ describe("submitMatchingPayment", () => {
 
     expect(mockTransactionBuilder).toHaveBeenCalledTimes(1);
     expect(mockTransaction.sign).toHaveBeenCalledTimes(1);
+    expect(mockMemoText).toHaveBeenCalledWith(
+      `Match:${options.originalTxHash.slice(0, 20)}`,
+    );
     expect(mockSubmitWithFeeBump).toHaveBeenCalledTimes(1);
     expect(mockSubmitWithFeeBump.mock.calls[0][2]).toEqual({
       onRetry: expect.any(Function),

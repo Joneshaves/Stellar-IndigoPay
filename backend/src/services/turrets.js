@@ -13,6 +13,7 @@ const {
   TransactionBuilder,
   Networks,
   Operation,
+  Memo,
   Asset,
   Keypair,
 } = require("@stellar/stellar-sdk");
@@ -220,10 +221,7 @@ async function submitMatchingPayment({
           }),
         )
         .addMemo(
-          Operation.memo({
-            type: "text",
-            value: `Match:${originalTxHash.slice(0, 20)}`,
-          }),
+          Memo.text(`Match:${originalTxHash.slice(0, 20)}`),
         )
         .setTimeout(60)
         .build();

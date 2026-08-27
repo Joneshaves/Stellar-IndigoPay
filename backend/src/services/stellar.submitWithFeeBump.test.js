@@ -35,7 +35,19 @@ jest.mock("./tracing", () => ({
   withSpan: jest.fn((name, fn) => fn()),
 }));
 
-const { submitWithFeeBump } = require("./stellar");
+const logger = require("../logger");
+const { registry } = require("./metrics");
+const {
+  submitWithFeeBump,
+  rpcBreaker,
+  horizonRpcBreaker,
+} = require("./stellar");
+
+async function counterValue(name) {
+  const metric = registry.getSingleMetric(name);
+  const result = await metric.get();
+  return result.values.reduce((sum, value) => sum + value.value, 0);
+}
 
 describe("submitWithFeeBump Horizon retry", () => {
   beforeEach(() => {
@@ -73,5 +85,37 @@ describe("submitWithFeeBump Horizon retry", () => {
     );
     expect(onRetry).toHaveBeenCalledTimes(1);
     expect(mockTransactionBuilder.buildFeeBumpTransaction).not.toHaveBeenCalled();
+
+    expect(horizonRpcBreaker).not.toBe(rpcBreaker);
+    expect(horizonRpcBreaker.name).toBe("horizon");
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "horizon_retry" }),
+      expect.stringContaining("Horizon transient error"),
+    );
+  });
+
+  test("increments only the Horizon retry counter", async () => {
+    const sorobanBefore = await counterValue(
+      "indigopay_soroban_rpc_retries_total",
+    );
+    const horizonBefore = await counterValue("indigopay_horizon_retries_total");
+    const transaction = {
+      operations: [{ type: "payment" }],
+      fee: "100",
+      toXDR: jest.fn().mockReturnValue("signed-xdr"),
+      hash: jest.fn().mockReturnValue({
+        toString: jest.fn().mockReturnValue("tx-hash"),
+      }),
+    };
+    const keypair = { publicKey: jest.fn().mockReturnValue("GMATCHER") };
+
+    await submitWithFeeBump(transaction, keypair);
+
+    expect(await counterValue("indigopay_horizon_retries_total")).toBe(
+      horizonBefore + 1,
+    );
+    expect(await counterValue("indigopay_soroban_rpc_retries_total")).toBe(
+      sorobanBefore,
+    );
   });
 });
