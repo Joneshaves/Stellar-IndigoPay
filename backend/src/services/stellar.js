@@ -115,9 +115,10 @@ function isRetryable(err) {
  *
  * @param {Function} fn           Async function to call.
  * @param {number}   [maxRetries] Override for MAX_RETRIES.
+ * @param {Function} [onRetry]    Called once immediately before each retry.
  * @returns {Promise<*>}
  */
-async function withRetry(fn, maxRetries = MAX_RETRIES) {
+async function withRetry(fn, maxRetries = MAX_RETRIES, onRetry) {
   let lastError;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -135,6 +136,9 @@ async function withRetry(fn, maxRetries = MAX_RETRIES) {
 
       if (attempt < maxRetries && isRetryable(err)) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        if (typeof onRetry === "function") {
+          onRetry({ attempt: attempt + 1, maxRetries, error: err });
+        }
         logger.warn(
           {
             event: "soroban_rpc_retry",
@@ -432,6 +436,7 @@ async function getOnChainUsdcToken() {
  * @param {Transaction} transaction - The signed transaction object
  * @param {Keypair} keypair - The keypair to sign the fee bump
  * @param {object} options
+ * @param {Function} [options.onRetry] - Called once per transient Horizon retry.
  * @returns {Promise<object>} The final transaction result
  */
 async function submitWithFeeBump(transaction, keypair, options = {}) {
@@ -449,7 +454,11 @@ async function submitWithFeeBump(transaction, keypair, options = {}) {
         const res = await submitTransaction(currentTx.toXDR());
         hash = res.hash || currentTx.hash().toString('hex'); // submitTransaction returns hash in some versions
       } else {
-        const res = await server.submitTransaction(currentTx);
+        const res = await withRetry(
+          () => server.submitTransaction(currentTx),
+          undefined,
+          options && options.onRetry,
+        );
         hash = res.hash;
       }
     } catch (err) {

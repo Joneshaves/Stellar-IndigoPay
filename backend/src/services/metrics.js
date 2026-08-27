@@ -423,6 +423,19 @@ const recurringPending = new client.Gauge({
   registers: [registry],
 });
 
+const matchRetry = new client.Counter({
+  name: "indigopay_match_retries_total",
+  help: "Total retries of matching payment submissions after transient failures.",
+  registers: [registry],
+});
+
+const recurringKeeperFeeStroops = new client.Histogram({
+  name: "recurring_keeper_fee_stroops",
+  help: "Chosen recurring keeper transaction fee in stroops.",
+  buckets: [100, 500, 1000, 5000, 10000, 50000, 100000, 250000, 500000, 1000000],
+  registers: [registry],
+});
+
 
 /**
  * Normalise an Express req.route.path / req.path to a low-cardinality
@@ -615,6 +628,8 @@ const metrics = {
   pushLatencySeconds,
   postgresFailoverTotal,
   redisSentinelFailoverTotal,
+  matchRetry,
+  recurringKeeperFeeStroops,
   projectionEventsProcessedTotal,
   projectionLagEvents,
   projectionRebuildDurationSeconds,
@@ -627,6 +642,8 @@ module.exports = {
   registry,
   metrics,
   idempotencyRaceWinsTotal,
+  matchRetry,
+  recurringKeeperFeeStroops,
   cacheHits,
   cacheMisses,
   cacheCoalesced,

@@ -14,8 +14,12 @@ const {
   Networks,
   Operation,
   Asset,
+  Keypair,
 } = require("@stellar/stellar-sdk");
 const pool = require("../db/pool");
+const { metrics } = require("./metrics");
+
+const MATCHING_IDEMPOTENCY_NAMESPACE = "turrets:matching";
 
 // Network configuration
 const NETWORK = process.env.STELLAR_NETWORK || "testnet";
@@ -102,32 +106,21 @@ async function matchDonationTxFunction(payment) {
       });
 
       if (matchResult.success) {
-        // Update the matched amount in the database
-        await pool.query(
-          `UPDATE donation_matches 
-           SET matched_xlm = matched_xlm + $1 
-           WHERE id = $2`,
-          [matchAmount, match.id],
-        );
-
-        // Record the matched donation
-        await pool.query(
-          `INSERT INTO donations (
-            id, project_id, donor_address, amount_xlm, amount, currency, 
-            message, transaction_hash, created_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
-          [
-            require("uuid").v4(),
-            project.id,
-            match.matcher_address,
-            matchAmount,
-            matchAmount,
-            "XLM",
-            `Matching donation for ${from}`,
+        if (!matchResult.alreadyProcessed) {
+          await recordMatchingDonation({
+            projectId: project.id,
+            donorAddress: match.matcher_address,
+            amount: matchAmount,
+            message: `Matching donation for ${from}`,
+            txHash: matchResult.txHash,
+            matchId: match.id,
+          });
+          await markMatchingEffectsRecorded(
+            transaction_hash,
+            match.id,
             matchResult.txHash,
-          ],
-        );
+          );
+        }
 
         totalMatched += matchAmount;
         matchResults.push({
@@ -171,36 +164,37 @@ async function submitMatchingPayment({
   originalTxHash,
   matchId,
 }) {
+  const idempotencyKey = `${MATCHING_IDEMPOTENCY_NAMESPACE}:${originalTxHash}:${matchId}`;
+
   try {
-    // Load the matcher account
-    const matcherAccount = await getServer().loadAccount(matcherAddress);
+    const existing = await pool.query(
+      "SELECT response_body FROM idempotency_keys WHERE key = $1",
+      [idempotencyKey],
+    );
+    const existingResponse = getStoredMatchingResponse(existing.rows[0]);
+    if (existingResponse) return existingResponse;
 
-    // Build the payment transaction
-    const transaction = new TransactionBuilder(matcherAccount, {
-      fee: "100",
-      networkPassphrase: NETWORK_PASSPHRASE,
-    })
-      .addOperation(
-        Operation.payment({
-          destination: projectWallet,
-          asset: Asset.native(),
-          amount: amount.toFixed(7),
-        }),
-      )
-      .addMemo(
-        Operation.memo({
-          type: "text",
-          value: `Match:${originalTxHash.slice(0, 20)}`,
-        }),
-      )
-      .setTimeout(60)
-      .build();
+    let transaction;
 
-    // In a real implementation, this would use pre-signed transactions
-    // For now, we'll need the matcher's secret key to sign
-    // This should be stored securely (e.g., in environment variables or a secret manager)
+    const pending = getPendingMatchingTransaction(existing.rows[0]);
+    if (pending) {
+      transaction = recoverMatchingTransaction(pending);
+      const recorded = await findSuccessfulMatchingTransaction(pending.txHash);
+      if (recorded) {
+        const response = { success: true, txHash: pending.txHash };
+        await storeMatchingResponse(idempotencyKey, response);
+        return response;
+      }
+    } else if (existing.rows[0]) {
+      // A legacy processing row has no transaction that can be safely
+      // recovered. Never create a new payment for an unknown reservation.
+      return {
+        success: false,
+        reason: "Matching payment reservation has no recoverable transaction",
+      };
+    }
+
     const matcherSecret = process.env.MATCHER_SECRET_KEY;
-
     if (!matcherSecret) {
       console.warn(
         "MATCHER_SECRET_KEY not configured. Cannot submit matching payment.",
@@ -208,24 +202,216 @@ async function submitMatchingPayment({
       return { success: false, reason: "Matcher secret not configured" };
     }
 
-    // Sign the transaction
-    const keypair = require("@stellar/stellar-sdk").Keypair.fromSecret(matcherSecret);
-    transaction.sign(keypair);
+    const keypair = Keypair.fromSecret(matcherSecret);
+    if (!pending && !existing.rows[0]) {
+      // Build and sign exactly once before reserving the idempotency key.
+      // Losing a reservation race discards this candidate and recovers the
+      // winner's persisted transaction instead.
+      const matcherAccount = await getServer().loadAccount(matcherAddress);
+      transaction = new TransactionBuilder(matcherAccount, {
+        fee: "100",
+        networkPassphrase: NETWORK_PASSPHRASE,
+      })
+        .addOperation(
+          Operation.payment({
+            destination: projectWallet,
+            asset: Asset.native(),
+            amount: amount.toFixed(7),
+          }),
+        )
+        .addMemo(
+          Operation.memo({
+            type: "text",
+            value: `Match:${originalTxHash.slice(0, 20)}`,
+          }),
+        )
+        .setTimeout(60)
+        .build();
+      transaction.sign(keypair);
 
-    // Submit to Horizon with fee bump
+      const pendingResponse = JSON.stringify({
+        status: "processing",
+        txHash: transaction.hash().toString("hex"),
+        signedXDR: transaction.toXDR(),
+        effectsRecorded: false,
+      });
+      const reservation = await pool.query(
+        `INSERT INTO idempotency_keys
+           (key, request_body_hash, response_status, response_body)
+         VALUES ($1, '', 202, $2)
+         ON CONFLICT (key) DO NOTHING
+         RETURNING key`,
+        [idempotencyKey, pendingResponse],
+      );
+      if (!reservation.rows[0]) {
+        const raced = await pool.query(
+          "SELECT response_body FROM idempotency_keys WHERE key = $1",
+          [idempotencyKey],
+        );
+        const racedResponse = getStoredMatchingResponse(raced.rows[0]);
+        if (racedResponse) return racedResponse;
+        const racedPending = getPendingMatchingTransaction(raced.rows[0]);
+        if (!racedPending) {
+          return {
+            success: false,
+            reason: "Matching payment reservation has no recoverable transaction",
+          };
+        }
+        transaction = recoverMatchingTransaction(racedPending);
+        const recorded = await findSuccessfulMatchingTransaction(
+          racedPending.txHash,
+        );
+        if (recorded) {
+          const response = { success: true, txHash: racedPending.txHash };
+          await storeMatchingResponse(idempotencyKey, response);
+          return response;
+        }
+      }
+    }
+
     const { submitWithFeeBump } = require("./stellar");
-    const result = await submitWithFeeBump(transaction, keypair);
+    const result = await submitWithFeeBump(transaction, keypair, {
+      onRetry: () => metrics.matchRetry.inc(),
+    });
 
     console.log(`Matching payment submitted: ${result.hash}`);
 
-    return {
+    const response = {
       success: true,
       txHash: result.hash,
     };
+    await storeMatchingResponse(idempotencyKey, response);
+    return response;
   } catch (error) {
     console.error("Error submitting matching payment:", error);
     return { success: false, error: error.message };
   }
+}
+
+async function findSuccessfulMatchingTransaction(txHash) {
+  const { getTransaction } = require("./stellar");
+  if (typeof getTransaction !== "function") return null;
+
+  try {
+    const result = await getTransaction(txHash);
+    return result && result.successful ? result : null;
+  } catch {
+    // A missing or temporarily unavailable Horizon record is safe to handle
+    // by resubmitting the exact signed transaction below.
+    return null;
+  }
+}
+
+async function storeMatchingResponse(idempotencyKey, response) {
+  await pool.query(
+    "UPDATE idempotency_keys SET response_body = $1, response_status = 200 WHERE key = $2",
+    [JSON.stringify({ ...response, effectsRecorded: false }), idempotencyKey],
+  );
+}
+
+function getStoredMatchingResponse(row) {
+  const response = parseIdempotencyResponse(row);
+  if (
+    !response ||
+    response.status === "processing" ||
+    response.success !== true ||
+    !response.txHash
+  ) {
+    return null;
+  }
+
+  return {
+    success: true,
+    txHash: response.txHash,
+    ...(response.effectsRecorded === true ? { alreadyProcessed: true } : {}),
+  };
+}
+
+function getPendingMatchingTransaction(row) {
+  const response = parseIdempotencyResponse(row);
+  if (!response || !response.txHash || !response.signedXDR) return null;
+  return response;
+}
+
+function parseIdempotencyResponse(row) {
+  if (!row || row.response_body === null || row.response_body === undefined) {
+    return null;
+  }
+
+  if (typeof row.response_body === "object") return row.response_body;
+  try {
+    return JSON.parse(row.response_body);
+  } catch {
+    return null;
+  }
+}
+
+function recoverMatchingTransaction(pending) {
+  let transaction;
+  try {
+    transaction = TransactionBuilder.fromXDR(
+      pending.signedXDR,
+      NETWORK_PASSPHRASE,
+    );
+  } catch (error) {
+    throw new Error(`Stored matching transaction cannot be decoded: ${error.message}`);
+  }
+
+  const transactionHash = transaction.hash().toString("hex");
+  if (transactionHash !== pending.txHash) {
+    throw new Error("Stored matching transaction hash does not match its XDR");
+  }
+  return transaction;
+}
+
+async function recordMatchingDonation({
+  projectId,
+  donorAddress,
+  amount,
+  message,
+  txHash,
+  matchId,
+}) {
+  await pool.query(
+    `WITH inserted AS (
+       INSERT INTO donations (
+         id, project_id, donor_address, amount_xlm, amount, currency,
+         message, transaction_hash, created_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT DO NOTHING
+       RETURNING id
+     )
+     UPDATE donation_matches
+     SET matched_xlm = matched_xlm + $4
+     WHERE id = $9 AND EXISTS (SELECT 1 FROM inserted)`,
+    [
+      require("uuid").v4(),
+      projectId,
+      donorAddress,
+      amount,
+      amount,
+      "XLM",
+      message,
+      txHash,
+      matchId,
+    ],
+  );
+}
+
+async function markMatchingEffectsRecorded(originalTxHash, matchId, txHash) {
+  const idempotencyKey = `${MATCHING_IDEMPOTENCY_NAMESPACE}:${originalTxHash}:${matchId}`;
+  await pool.query(
+    "UPDATE idempotency_keys SET response_body = $1 WHERE key = $2 AND response_status = 200",
+    [
+      JSON.stringify({
+        success: true,
+        txHash,
+        effectsRecorded: true,
+      }),
+      idempotencyKey,
+    ],
+  );
 }
 
 /**

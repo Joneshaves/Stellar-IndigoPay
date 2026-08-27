@@ -75,6 +75,7 @@ jest.mock("../../src/services/stellar", () => {
     simulateTransactionWithRetry: jest.fn(),
     server: {
       loadAccount: jest.fn(),
+      fetchBaseFee: jest.fn().mockResolvedValue(100),
     },
   };
 });
@@ -120,6 +121,9 @@ describe("recurringKeeper Service", () => {
     process.env.CONTRACT_ID = "test-contract-id";
     metrics.recurringPending = { set: jest.fn() };
     metrics.recurringExecutionsTotal = { inc: jest.fn() };
+    metrics.recurringKeeperFeeStroops = { observe: jest.fn() };
+    delete process.env.RECURRING_KEEPER_FEE_MULTIPLIER;
+    delete process.env.RECURRING_KEEPER_FEE_MAX_STROOPS;
   });
 
   afterEach(async () => {
@@ -170,8 +174,25 @@ describe("recurringKeeper Service", () => {
     expect(simulateTransactionWithRetry).toHaveBeenCalled();
     expect(submitWithFeeBump).toHaveBeenCalledWith(expect.anything(), expect.anything());
     expect(builtAccounts().map((a) => a.sequenceNumber())).toEqual([100]);
+    expect(TransactionBuilder.mock.calls[0][1].fee).toBe("150");
+    expect(server.fetchBaseFee).toHaveBeenCalledTimes(1);
+    expect(metrics.recurringKeeperFeeStroops.observe).toHaveBeenCalledWith(150);
     expect(metrics.recurringPending.set).toHaveBeenCalledWith(1);
     expect(metrics.recurringExecutionsTotal.inc).toHaveBeenCalledWith({ status: "success" });
+  });
+
+  test("caps a high calculated recurring keeper fee", async () => {
+    pool.query.mockResolvedValueOnce({ rows: [dueSchedule()] });
+    server.loadAccount
+      .mockResolvedValueOnce(account(100))
+      .mockResolvedValueOnce(account(100));
+    server.fetchBaseFee.mockResolvedValueOnce(1000000);
+    simulateTransactionWithRetry.mockResolvedValueOnce({ error: null, result: { retval: {} } });
+
+    await recurringKeeper.runKeeperCycle();
+
+    expect(TransactionBuilder.mock.calls[0][1].fee).toBe("500000");
+    expect(metrics.recurringKeeperFeeStroops.observe).toHaveBeenCalledWith(500000);
   });
 
   test("reloads the keeper account before every submission so sequences are never stale", async () => {

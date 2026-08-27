@@ -33,6 +33,10 @@ const { createDrainController } = require("./workerLifecycle");
 let intervalId = null;
 let isExecuting = false;
 
+const DEFAULT_KEEPER_BASE_FEE_STROOPS = 100000;
+const DEFAULT_KEEPER_FEE_MULTIPLIER = 1.5;
+const DEFAULT_KEEPER_FEE_MAX_STROOPS = 500000;
+
 // Tracks whether a keeper cycle is currently in flight so `stop()` can
 // wait for it to finish (or release control after its grace period)
 // instead of returning immediately while a cycle is still submitting
@@ -186,9 +190,10 @@ async function fetchDueSchedules() {
 async function executeSchedule(schedule, account, keypair) {
   const contractId = process.env.CONTRACT_ID;
   const contract = new Contract(contractId);
+  const fee = await getRecurringKeeperFee();
   
   const tx = new TransactionBuilder(account, {
-    fee: "100000", // High starting fee for simulation
+    fee: fee.toString(),
     networkPassphrase: NETWORK_PASSPHRASE,
   })
     .addOperation(
@@ -222,6 +227,63 @@ async function executeSchedule(schedule, account, keypair) {
     },
     `Recurring donation executed successfully on-chain (txHash: ${submitResult.hash})`
   );
+}
+
+async function getRecurringKeeperFee() {
+  let baseFee = DEFAULT_KEEPER_BASE_FEE_STROOPS;
+  try {
+    if (typeof stellarServer.fetchBaseFee === "function") {
+      baseFee = stellarServer.fetchBaseFee();
+      baseFee = await baseFee;
+    }
+  } catch (err) {
+    logger.warn(
+      { event: "recurring_keeper_base_fee_failed", err: err.message },
+      "Failed to fetch Stellar base fee; using fallback",
+    );
+  }
+
+  const parsedBaseFee = parsePositiveNumber(
+    baseFee,
+    DEFAULT_KEEPER_BASE_FEE_STROOPS,
+  );
+  const multiplier = parsePositiveNumber(
+    process.env.RECURRING_KEEPER_FEE_MULTIPLIER,
+    DEFAULT_KEEPER_FEE_MULTIPLIER,
+  );
+  const maxFee = parsePositiveInteger(
+    process.env.RECURRING_KEEPER_FEE_MAX_STROOPS,
+    DEFAULT_KEEPER_FEE_MAX_STROOPS,
+  );
+  const effectiveFee = Math.min(Math.ceil(parsedBaseFee * multiplier), maxFee);
+
+  logger.info(
+    {
+      event: "recurring_keeper_fee_selected",
+      baseFee: parsedBaseFee,
+      multiplier,
+      maxFee,
+      effectiveFee,
+    },
+    `Using recurring keeper fee of ${effectiveFee} stroops`,
+  );
+  if (metrics.recurringKeeperFeeStroops) {
+    metrics.recurringKeeperFeeStroops.observe(effectiveFee);
+  }
+  return effectiveFee;
+}
+
+function parsePositiveNumber(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = parsePositiveNumber(value, fallback);
+  return Number.isInteger(parsed) ? parsed : fallback;
 }
 
 module.exports = {
